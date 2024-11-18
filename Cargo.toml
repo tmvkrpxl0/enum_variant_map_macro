@@ -1,18 +1,17 @@
 [package]
-name = "ordinalizer"
+name = "enum_variant_map_macro"
 version = "0.1.0"
-authors = ["caelunshun <caelunshun@gmail.com>"]
+authors = ["caelunshun <caelunshun@gmail.com>", "tmvkrpxl0 <tmvkrpxl0@proton.me>"]
 edition = "2018"
 license = "MIT OR Apache-2.0"
-description = "Derive an ordinal function for enums which returns the index of a variant in the enum definition."
-documentation = "https://docs.rs/ordinalize"
-homepage = "https://github.com/caelunshun/ordinalize"
+description = "Macro for enum_variant_map crate, based on ordinalize crate originally written by caelunshun"
 
 [lib]
 proc-macro = true
 
 [dependencies]
-syn = "1.0"
+syn = "2.0"
 proc-macro2 = "1.0"
 quote = "1.0"
 proc-macro-error = "1.0"
+enum_variant_map_types = { path = "../enum_variant_map_types" }
