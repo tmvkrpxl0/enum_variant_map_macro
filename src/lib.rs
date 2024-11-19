@@ -41,15 +41,12 @@
 
 use proc_macro2::{Ident, TokenStream};
 use proc_macro_error::*;
-use quote::quote;
-use syn::{parse_macro_input, DeriveInput};
+use quote::{quote, ToTokens};
+use syn::{DeriveInput, parse_macro_input, Path, PathArguments, PathSegment, Variant, Visibility};
 use syn::parse::{Parse, ParseStream};
-
-struct Variant<'a> {
-    ident: &'a Ident,
-    unit_field_count: usize,
-    has_named_fields: bool,
-}
+use syn::punctuated::Punctuated;
+use syn::spanned::Spanned;
+use syn::token::{Comma, PathSep};
 
 /// Generates `fn ordinal(&self) -> usize` and `COUNT` constants for an enum.
 ///
@@ -66,13 +63,16 @@ pub fn derive_variant_map(input: proc_macro::TokenStream) -> proc_macro::TokenSt
     let input = parse_macro_input!(input as DeriveInput);
 
     let variants = detect_variants(&input);
+    let visibility = &input.vis;
 
     let match_arms = generate_match_arms(&variants, &input);
+    let getters = generate_ordinal_getters(&variants, visibility);
 
     let enum_ident = &input.ident;
     let generics = &input.generics;
 
     let count = variants.len();
+    let container_name = Ident::new(&format!("_{}EVMIndexContainer", enum_ident.to_string()), enum_ident.span());
     let tokens = quote! {
         impl#generics enum_variant_map_types::VariantMap for #enum_ident #generics {
             const COUNT: usize = #count;
@@ -83,12 +83,17 @@ pub fn derive_variant_map(input: proc_macro::TokenStream) -> proc_macro::TokenSt
                 }
             }
         }
+
+        #visibility struct #container_name;
+        impl #container_name {
+            #(#getters)*
+        }
     };
 
     tokens.into()
 }
 
-fn detect_variants(input: &DeriveInput) -> Vec<Variant> {
+fn detect_variants(input: &DeriveInput) -> Vec<&Variant> {
     let mut vec = Vec::new();
 
     let data = match &input.data {
@@ -97,65 +102,160 @@ fn detect_variants(input: &DeriveInput) -> Vec<Variant> {
     };
 
     for variant in &data.variants {
-        vec.push(detect_variant(variant));
+        vec.push(variant);
     }
 
     vec
 }
 
-fn detect_variant(variant: &syn::Variant) -> Variant {
-    let ident = &variant.ident;
-
-    let (unit_field_count, has_named_fields) = match &variant.fields {
-        syn::Fields::Named(_) => (0, true),
-        syn::Fields::Unit => (0, false),
-        syn::Fields::Unnamed(unnanmed) => (unnanmed.unnamed.len(), false),
-    };
-
-    Variant {
-        ident,
-        unit_field_count,
-        has_named_fields,
-    }
-}
-
-fn generate_match_arms(variants: &[Variant], input: &DeriveInput) -> Vec<TokenStream> {
+fn generate_match_arms(variants: &[&Variant], input: &DeriveInput) -> Vec<TokenStream> {
     let mut vec = Vec::new();
     let enum_ident = &input.ident;
 
     for (ordinal, variant) in variants.iter().enumerate() {
-        let variant_ident = variant.ident;
-        let pattern = match (variant.has_named_fields, variant.unit_field_count) {
-            (true, _) | (false, 0) => quote! { #enum_ident::#variant_ident { .. } },
-            (false, x) => {
-                let underscores: Vec<_> = (0..x).map(|_| quote! { _ }).collect();
-
-                quote! {
-                    #enum_ident::#variant_ident(#(#underscores),*)
-                }
-            }
+        let variant_ident = &variant.ident;
+        let pattern = quote! { #enum_ident::#variant_ident { .. } };
+        let arm = quote! {
+            #pattern => #ordinal
         };
 
-        vec.push(quote! {
-            #pattern => #ordinal
-        });
+        vec.push(arm);
     }
 
     vec
 }
 
+fn generate_ordinal_getters(variants: &[&Variant], visibility: &Visibility) -> Vec<TokenStream> {
+    let mut getters = vec![];
+
+    for (ordinal, variant) in variants.iter().enumerate() {
+        let variant_ident = &variant.ident;
+        let function_name = Ident::new(&format!("evm_ordinal_{}", variant_ident.to_string()), variant_ident.span());
+        getters.push(quote! {
+            #[allow(non_snake_case)]
+            #visibility const fn #function_name() -> usize {
+                #ordinal
+            }
+        })
+    }
+
+    getters
+}
+
+fn new_variant_trait_checker(enum_path: &Punctuated<PathSegment, PathSep>) -> TokenStream {
+    quote! {
+        let _: Option<enum_variant_map::EnumVariantMap<#enum_path>> = None;
+    }
+}
+
+fn new_map_type_checker(map_identifier: &Ident, enum_path: &Punctuated<PathSegment, PathSep>) -> TokenStream {
+    quote! {
+        let _: Option<&#enum_path> = if false {
+            #map_identifier.get_by_index(0)
+        } else {
+            None
+        };
+    }
+}
+
+fn new_variant_name_checker(
+    enum_path: &Punctuated<PathSegment, PathSep>,
+    enum_path_no_param: &Punctuated<PathSegment, PathSep>,
+    variant_ident: &Ident
+) -> TokenStream {
+    quote! {
+        match Option::<#enum_path>::None {
+            Some(#enum_path_no_param::#variant_ident { .. }) => {}
+            _ => {}
+        };
+    }
+}
+
 #[proc_macro]
 pub fn get(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
-    let input = parse_macro_input!(input as VariantMapGetter);
+    let VariantMapGetter {
+        map, enum_path, variant_ident
+    } = parse_macro_input!(input as VariantMapGetter);
+    let no_path_param = {
+        let mut enum_path = enum_path.clone();
+        remove_path_parameters(&mut enum_path);
+        enum_path
+    };
+
+    // checks if supplied enum has VariantMap trait
+    let trait_checker = new_variant_trait_checker(&enum_path);
+
+    // checks type of map is correct
+    let map_type_checker = new_map_type_checker(&map, &enum_path);
+
+    // checks if the variant name is correct
+    let variant_checker = new_variant_name_checker(&enum_path, &no_path_param, &variant_ident);
+
+    let struct_name = {
+        format!("_{}EVMIndexContainer", no_path_param.to_token_stream().to_string())
+    };
+    let function_name = Ident::new(&format!("evm_ordinal_{}", variant_ident), variant_ident.span());
+    let container_name = Ident::new(&struct_name, enum_path.span());
+    let invoke_getter = quote! {
+        unsafe {
+            #map.get_by_index_unsafe(#container_name::#function_name())
+        }
+    };
+
+    let token_stream = quote! {
+        {
+            #trait_checker
+            #map_type_checker
+            #variant_checker
+            #invoke_getter
+        }
+    };
+    // eprintln!("{}", token_stream);
+
+    token_stream.into()
 }
 
 struct VariantMapGetter {
     map: Ident,
-    colon: syn::Path
+    enum_path: Punctuated<PathSegment, PathSep>,
+    variant_ident: Ident,
 }
 
 impl Parse for VariantMapGetter {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        todo!()
+        let map: Ident = input.parse()?;
+        let _: Comma = input.parse()?;
+        let path: Path = input.parse()?;
+
+        let segments = &path.segments;
+        let (enum_path, variant_ident) = {
+            let mut cloned = segments.clone();
+            let Some(last) = cloned.pop() else {
+                return Err(input.error("Cannot invoke get! without specifying both enum's type and variant's name"));
+            };
+            cloned.pop_punct();
+
+            let last = last.into_value();
+            (cloned, last.ident)
+        };
+
+        Ok(Self {
+            map,
+            enum_path,
+            variant_ident,
+        })
     }
+}
+
+fn remove_path_parameters(path: &mut Punctuated<PathSegment, PathSep>) {
+    let Some(last) = path.last() else {
+        abort_call_site!("Invalid enum path!")
+    } ;
+    if let PathArguments::None = last.arguments {
+        return;
+    }
+
+    let mut last = path.pop().unwrap();
+    last.value_mut().arguments = PathArguments::None;
+    path.push(last.into_value());
 }
